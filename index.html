@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html>
+<head>
+  <base target="_top">
+  <?!= include('Style'); ?>
+</head>
+<body>
+  <div class="wrap">
+    <label for="order">Order ID</label>
+    <select id="order"></select>
+
+    <label for="model">Model</label>
+    <select id="model"></select>
+
+    <div class="counter" id="counter">— / —</div>
+    <div class="track"><div class="bar" id="bar"></div></div>
+
+    <input id="scan" autocomplete="off" spellcheck="false" placeholder="Yahan scan karo">
+
+    <div class="msg" id="msg">Order aur Model select karo</div>
+
+    <div class="head">
+      <b>Recent scans</b>
+      <button id="refresh" type="button">↻ Refresh</button>
+    </div>
+    <ul id="recent"></ul>
+  </div>
+
+  <div class="lost hidden" id="lost">⚠ Scanner se focus hat gaya<br><span>Yahan click karo</span></div>
+
+  <?!= include('App'); ?>
+</body>
+</html>
