@@ -1,0 +1,202 @@
+<script>
+  const $ = id => document.getElementById(id);
+  let orders = [];          // [{order, items:[{model, qty, scanned}]}]
+  let queue = [];           // scans waiting to save
+  let inflight = null;      // batch being saved
+  const seen = new Set();   // is session me scan hue barcodes
+  const sel = { order: '', model: '' };
+  const keyOf = (o, m) => o + ' / ' + m;
+
+  /* ---------- data ---------- */
+  function load() {
+    google.script.run
+      .withSuccessHandler(d => { orders = d; renderOrders(); })
+      .withFailureHandler(e => msg('❌ ' + e.message, 'err'))
+      .getOrders();
+  }
+
+  const itemOf = (o, m) => { const x = orders.find(z => z.order === o); return x ? x.items.find(i => i.model === m) : null; };
+  const current = () => itemOf(sel.order, sel.model);
+  const pendingItems = o => { const x = orders.find(z => z.order === o); return x ? x.items.filter(i => i.scanned < i.qty) : []; };
+  const pendingCount = k => queue.filter(q => q.k === k).length + (inflight && inflight.k === k ? inflight.codes.length : 0);
+
+  /* ---------- render ---------- */
+  function renderOrders() {
+    const list = orders.filter(o => o.items.some(i => i.scanned < i.qty));
+    $('order').innerHTML = '<option value="">— Order select —</option>' +
+      list.map(o => `<option value="${esc(o.order)}">${esc(o.order)}</option>`).join('');
+    if (list.some(o => o.order === sel.order)) $('order').value = sel.order;
+    else sel.order = '';
+    renderModels();
+  }
+
+  function renderModels() {
+    const items = pendingItems(sel.order);
+    $('model').innerHTML = '<option value="">— Model select —</option>' +
+      items.map(i => `<option value="${esc(i.model)}">${esc(i.model)}  (${i.scanned}/${i.qty})</option>`).join('');
+    if (items.some(i => i.model === sel.model)) $('model').value = sel.model;
+    else if (items.length === 1) { sel.model = items[0].model; $('model').value = sel.model; }
+    else sel.model = '';
+    counter();
+    focusScan();
+  }
+
+  function counter() {
+    const it = current();
+    if (!it) { $('counter').textContent = '— / —'; $('bar').style.width = '0'; return; }
+    const n = it.scanned + pendingCount(keyOf(sel.order, sel.model));
+    $('counter').textContent = n + ' / ' + it.qty;
+    $('bar').style.width = Math.min(100, n / it.qty * 100) + '%';
+  }
+
+  function msg(text, type) { const m = $('msg'); m.textContent = text; m.className = 'msg ' + (type || ''); }
+
+  function addRow(code, status, note) {
+    const li = document.createElement('li');
+    li.className = status;
+    li.dataset.code = code;
+    li.innerHTML = `<span>${esc(code)}</span><span class="note">${esc(note || '')}</span>`;
+    const ul = $('recent');
+    ul.insertBefore(li, ul.firstChild);
+    while (ul.children.length > 30) ul.removeChild(ul.lastChild);
+  }
+
+  function setRow(code, status, note) {
+    for (const li of $('recent').children) {
+      if (li.dataset.code === code && li.classList.contains('wait')) {
+        li.className = status;
+        li.querySelector('.note').textContent = note || (status === 'ok' ? '✔' : '');
+        return;
+      }
+    }
+  }
+
+  /* ---------- scanning ---------- */
+  $('scan').addEventListener('keydown', e => {
+    if (e.key !== 'Enter' && e.key !== 'Tab') return;
+    e.preventDefault();
+    const v = $('scan').value.trim();
+    $('scan').value = '';
+    if (v) onScan(v);
+  });
+
+  function onScan(code) {
+    const it = current();
+    if (!it) return reject(code, 'Pehle Order + Model select karo');
+    if (seen.has(code)) return reject(code, 'Duplicate — abhi scan ho chuka');
+    const k = keyOf(sel.order, sel.model);
+    if (it.scanned + pendingCount(k) >= it.qty) return reject(code, 'Qty full (' + it.qty + ')');
+
+    seen.add(code);
+    queue.push({ code, order: sel.order, model: sel.model, k, retry: false });
+    addRow(code, 'wait', sel.model);
+    beep(true);
+    counter();
+    flush();
+  }
+
+  function reject(code, reason) {
+    addRow(code, 'err', reason);
+    msg('❌ ' + code + ' — ' + reason, 'err');
+    beep(false);
+  }
+
+  function flush() {
+    if (inflight || !queue.length) return;
+    const k = queue[0].k, batch = [];
+    while (queue.length && queue[0].k === k) batch.push(queue.shift());
+    inflight = { k, order: batch[0].order, model: batch[0].model, codes: batch.map(b => b.code), batch };
+    google.script.run
+      .withSuccessHandler(onSaved)
+      .withFailureHandler(onFail)
+      .saveScans(inflight.order, inflight.model, inflight.codes, batch.some(b => b.retry));
+  }
+
+  function onFail() {
+    const b = inflight.batch;
+    inflight = null;
+    b.forEach(x => x.retry = true);
+    queue.unshift(...b);
+    msg('⚠ Network issue — retry ho raha hai, scanning chalu rakho', 'warn');
+    setTimeout(flush, 2000);
+  }
+
+  function onSaved(res) {
+    const f = inflight;
+    inflight = null;
+
+    if (res.error) {
+      f.codes.forEach(c => { seen.delete(c); setRow(c, 'err', res.error); });
+      msg('❌ ' + res.error, 'err');
+      beep(false);
+      load();
+      return flush();
+    }
+
+    let lastOk = '';
+    res.results.forEach(r => {
+      if (r.ok) { setRow(r.code, 'ok'); lastOk = r.code; }
+      else {
+        setRow(r.code, 'err', r.reason);
+        if (!/^Duplicate/.test(r.reason)) seen.delete(r.code);
+        msg('❌ ' + r.code + ' — ' + r.reason, 'err');
+        beep(false);
+      }
+    });
+
+    const it = itemOf(f.order, f.model);
+    if (it) it.scanned = res.scanned;
+
+    if (it && it.scanned >= it.qty) modelDone(f.order, f.model);
+    else {
+      if (lastOk && res.results.every(r => r.ok)) msg('✔ ' + lastOk + '   →   ' + res.scanned + ' / ' + res.qty, 'ok');
+      counter();
+    }
+    flush();
+  }
+
+  function modelDone(order, model) {
+    beepDone();
+    if (sel.order !== order || sel.model !== model) { renderModels(); return; }
+    const rest = pendingItems(order);
+    if (rest.length) {
+      sel.model = rest[0].model;
+      renderModels();
+      msg('✅ ' + model + ' complete — ab ' + sel.model + ' scan karo', 'done');
+    } else {
+      sel.order = ''; sel.model = '';
+      renderOrders();
+      msg('✅ Order ' + order + ' COMPLETE — agla order select karo', 'done');
+    }
+  }
+
+  /* ---------- UI events ---------- */
+  $('order').addEventListener('change', () => { sel.order = $('order').value; sel.model = ''; renderModels(); });
+  $('model').addEventListener('change', () => { sel.model = $('model').value; counter(); focusScan(); });
+  $('refresh').addEventListener('click', () => { load(); focusScan(); });
+
+  function focusScan() { setTimeout(() => $('scan').focus(), 50); }
+  window.addEventListener('blur', () => $('lost').classList.remove('hidden'));
+  window.addEventListener('focus', () => { $('lost').classList.add('hidden'); focusScan(); });
+  $('lost').addEventListener('click', () => { $('lost').classList.add('hidden'); focusScan(); });
+  window.addEventListener('beforeunload', e => { if (queue.length || inflight) { e.preventDefault(); e.returnValue = ''; } });
+
+  /* ---------- sound ---------- */
+  let ac;
+  function tone(freq, dur) {
+    try {
+      ac = ac || new (window.AudioContext || window.webkitAudioContext)();
+      const o = ac.createOscillator(), g = ac.createGain();
+      o.frequency.value = freq; g.gain.value = 0.15;
+      o.connect(g); g.connect(ac.destination);
+      o.start(); o.stop(ac.currentTime + dur);
+    } catch (e) {}
+  }
+  const beep = ok => ok ? tone(1200, 0.06) : tone(220, 0.4);
+  const beepDone = () => { tone(880, 0.12); setTimeout(() => tone(1320, 0.25), 140); };
+
+  function esc(s) { return String(s).replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])); }
+
+  load();
+  focusScan();
+</script>
